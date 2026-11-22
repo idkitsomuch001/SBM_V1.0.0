@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-All%20rights%20reserved-red.svg)](https://github.com/idkitsomuch001)
 [![GitHub](https://img.shields.io/badge/GitHub-idkitsomuch001-181717?logo=github&logoColor=white)](https://github.com/idkitsomuch001)
-[![Discord DM](https://discord.com/users/1574160545064558685)
+[[Discord DM](https://discord.com/users/1574160545064558685)
 
 **A screen-only bot for Brawl Stars.** SBM reads the game from an Android emulator's screen with computer vision, decides what to do, and plays through touch input. It never reads the game's memory and never modifies the client: everything it knows comes from pixels.
 

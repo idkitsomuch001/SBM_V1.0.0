@@ -223,16 +223,25 @@ def _postprocess_raw(raw_output, conf_tresh=0.6, iou_thresh=0.6, end2end=False):
 class Detect:
     keypoint_shape = ()
 
-    def __init__(self, model_path, ignore_classes=None, classes=None, input_size=(640, 640), tile_size=54):
+    def __init__(self, model_path, ignore_classes=None, classes=None, input_size=(640, 640), tile_size=54,
+                 cpu_threads=None):
+        """cpu_threads caps the automatic CPU thread count for this model (None = automatic).
+
+        Terrain inference is off the frame loop, so on a CPU-only PC it should not take every core from the entity
+        model; the tile detector is created with a small cap.
+        """
         threads_to_use = load_toml_as_dict("cfg/general_config.toml")['used_threads']
 
-        def get_optimal_threads(max_limit=6):
+        def get_optimal_threads(max_limit=6, cap=None):
             threads = os.cpu_count() or 1
             threads_amount = min(threads, max(2, threads // 2), max_limit)
+            if cap is not None:
+                threads_amount = max(1, min(threads_amount, int(cap)))
             print(f"Detected {threads} CPU threads, using {threads_amount} threads.")
             return threads_amount
 
-        self.optimal_threads_amount = get_optimal_threads() if threads_to_use == "auto" else max(1, int(threads_to_use))
+        self.optimal_threads_amount = (get_optimal_threads(cap=cpu_threads) if threads_to_use == "auto"
+                                       else max(1, int(threads_to_use)))
         # Keep OpenCV's shared pool separate from ONNX inference threads.
         cv2.setNumThreads(max(1, int(os.environ.get("SBM_OPENCV_THREADS", min(self.optimal_threads_amount, 4)))))
         self.preferred_device = str(
@@ -454,6 +463,7 @@ class Detect:
         scale_x, scale_y = orig_w / new_w, orig_h / new_h
         step_x = max(1, int(self.tile_size / scale_x))
         step_y = max(1, int(self.tile_size / scale_y))
+        minimum_area = .0006 * new_w * new_h
         rows = []
 
         for class_id, name in enumerate(self.semantic_names):
@@ -466,27 +476,53 @@ class Detect:
             if not region.any():
                 continue
             if name != 'out_of_bounds':
+                # Even one retained component needs this much area, so a smaller whole class mask cannot emit anything.
+                if int(region.sum()) < minimum_area:
+                    continue
                 # Same small/weak-component rejection as the deployed semantic model.
                 n, labels, stats, _ = cv2.connectedComponentsWithStats(region, connectivity=8)
                 area = stats[:, cv2.CC_STAT_AREA]
                 mean = np.bincount(labels.ravel(), weights=confidence.ravel(), minlength=n) / np.maximum(area, 1)
-                keep = (area >= .0006 * new_w * new_h) & (mean >= .80)
+                keep = (area >= minimum_area) & (mean >= .80)
                 keep[0] = False
+                if not keep.any():
+                    continue
                 region = keep[labels].astype(np.uint8)
 
-            x0, y0, width, height = cv2.boundingRect(region)
             output_id = self.classes.index(tile_name)
-            # Each occupied cell produces one bounded rectangle, rather than one box around an entire lake/wall.
-            for y in range(y0 // step_y * step_y, y0 + height, step_y):
-                for x in range(x0 // step_x * step_x, x0 + width, step_x):
-                    cell = region[y:y + step_y, x:x + step_x]
-                    bx, by, bw, bh = cv2.boundingRect(cell)
-                    if not bw or not bh:
-                        continue
-                    score = float(confidence[y:y + step_y, x:x + step_x][cell > 0].mean())
-                    rows.append([int((x + bx) * scale_x), int((y + by) * scale_y),
-                                 min(orig_w, int(np.ceil((x + bx + bw) * scale_x))),
-                                 min(orig_h, int(np.ceil((y + by + bh) * scale_y))), score, output_id])
+            # Reduce the class mask to the tile grid in one block pass: min/max per cell gives the same tight
+            # boxes as cv2.boundingRect per cell, without sorting pixels or looping over every tile.
+            grid_w = (new_w + step_x - 1) // step_x
+            grid_h = (new_h + step_y - 1) // step_y
+            padded = np.zeros((grid_h * step_y, grid_w * step_x), dtype=np.uint8)
+            padded[:new_h, :new_w] = region
+            blocks = padded.reshape(grid_h, step_y, grid_w, step_x).transpose(0, 2, 1, 3)
+            occupied = blocks.any(axis=(2, 3))
+            cell_y, cell_x = np.nonzero(occupied)
+            if not len(cell_y):
+                continue
+            rows_present = blocks.any(axis=3)
+            cols_present = blocks.any(axis=2)
+            min_y = rows_present.argmax(axis=2)
+            max_y = step_y - 1 - rows_present[:, :, ::-1].argmax(axis=2)
+            min_x = cols_present.argmax(axis=2)
+            max_x = step_x - 1 - cols_present[:, :, ::-1].argmax(axis=2)
+            counts = blocks.sum(axis=(2, 3))
+            padded_conf = np.zeros((grid_h * step_y, grid_w * step_x), dtype=np.float32)
+            padded_conf[:new_h, :new_w] = confidence
+            conf_blocks = padded_conf.reshape(grid_h, step_y, grid_w, step_x).transpose(0, 2, 1, 3)
+            score_sums = (conf_blocks * blocks).sum(axis=(2, 3))
+            scores = score_sums[cell_y, cell_x] / counts[cell_y, cell_x]
+            x_start = cell_x * step_x
+            y_start = cell_y * step_y
+            rows.extend(np.column_stack((
+                ((x_start + min_x[cell_y, cell_x]) * scale_x).astype(np.int64),
+                ((y_start + min_y[cell_y, cell_x]) * scale_y).astype(np.int64),
+                np.minimum(orig_w, np.ceil((x_start + max_x[cell_y, cell_x] + 1) * scale_x).astype(np.int64)),
+                np.minimum(orig_h, np.ceil((y_start + max_y[cell_y, cell_x] + 1) * scale_y).astype(np.int64)),
+                scores,
+                np.full(len(cell_y), output_id, dtype=np.int64),
+            )).tolist())
 
         return [np.asarray(rows, dtype=np.float32).reshape(-1, 6)]
 

@@ -342,7 +342,7 @@ class WebDataService:
         return play_order in {"lowest_to_highest", "highest_to_lowest"}
 
     def get_queue_data(self) -> list[dict[str, Any]]:
-        self._sync_running_queue_from_saved_file()
+        self._sync_queue_from_saved_file()
         queue_items = []
         for item in self._queue_items:
             try:
@@ -366,20 +366,29 @@ class WebDataService:
         self._queue_items = normalized_items
         try:
             save_brawler_data(normalized_items)
+            try:
+                self._runtime_queue_mtime = resolve_project_path("latest_brawler_data.json").stat().st_mtime
+            except OSError:
+                self._runtime_queue_mtime = None
         except Exception as e:
             logger.error(f"Failed to save queue data to file: {e}")
         return normalized_items
 
-    def _sync_running_queue_from_saved_file(self):
-        runtime_status = self.runtime_manager.get_status()
-        if not runtime_status.get("is_running"):
-            return
+    def _sync_queue_from_saved_file(self):
+        """Pick up the queue the bot saved, also after the run has stopped.
 
+        The bot writes the current trophies to latest_brawler_data.json after
+        every match. Reloading only while the runtime was running left the
+        dashboard on the trophy count from when the bot was started.
+        """
         queue_path = resolve_project_path("latest_brawler_data.json")
         if not queue_path.exists():
             return
 
-        current_mtime = queue_path.stat().st_mtime
+        try:
+            current_mtime = queue_path.stat().st_mtime
+        except OSError:
+            return
         if self._runtime_queue_mtime == current_mtime:
             return
 

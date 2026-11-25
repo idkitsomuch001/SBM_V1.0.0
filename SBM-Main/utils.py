@@ -4,6 +4,7 @@ import io
 import math
 import os
 import random
+import tempfile
 import time
 from io import BytesIO
 import ctypes
@@ -140,8 +141,20 @@ def save_brawler_data(data):
     Save the given data to a json file. As a list of dictionaries.
     """
     queue_path = resolve_project_path("latest_brawler_data.json")
-    with open(queue_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=4)
+    # Write to a temporary file first so the dashboard never reads a half-written
+    # queue while the bot updates the trophies between two matches.
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{queue_path.name}.", suffix=".tmp", dir=queue_path.parent
+    )
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_name, queue_path)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
 
 
 def load_brawler_data():

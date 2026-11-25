@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ctypes
 import os
+import shutil
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -130,6 +132,122 @@ def unblock_bundled_webview_binaries(base_dir: Path | None = None) -> list[Path]
         print(f"Could not remove Windows download blocking from {binary_path}: {error}")
 
     return unblocked
+
+
+def webview2_runtime_available() -> bool:
+    """Whether the Edge WebView2 runtime that pywebview's window needs is installed.
+
+    pywebview silently falls back to the deprecated MSHTML (Internet Explorer)
+    renderer when the runtime is missing, and the dashboard does not work there.
+    Treat a missing runtime as "no desktop window" so the app window is used.
+    """
+    if not IS_WINDOWS:
+        return True
+    try:
+        import winreg
+    except ImportError:
+        return False
+
+    client_guids = (
+        "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",  # WebView2 runtime
+        "{2CD8A007-E189-409D-A2C8-9AF4EF3C72AA}",  # beta
+        "{0D50BFEC-CD6A-4F9A-964C-C7416E3ACB10}",  # dev
+        "{65C35B14-6C1D-4122-AC46-7148CC9D6497}",  # canary
+    )
+    paths = [
+        rf"SOFTWARE\Microsoft\EdgeUpdate\Clients\{guid}"
+        for guid in client_guids
+    ] + [
+        rf"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{guid}"
+        for guid in client_guids
+    ]
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        for path in paths:
+            try:
+                with winreg.OpenKey(hive, path) as key:
+                    version, _kind = winreg.QueryValueEx(key, "pv")
+            except OSError:
+                continue
+            if version and str(version) != "0.0.0.0":
+                return True
+    return False
+
+
+def find_chromium_browser() -> str | None:
+    """Path of an installed Edge or Chrome, used for a chromeless app window."""
+    if not IS_WINDOWS:
+        return None
+
+    candidates: list[Path] = []
+
+    # Windows registers installed browsers under App Paths; this also finds custom
+    # install locations that the standard folders below miss.
+    try:
+        import winreg
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            for exe in ("msedge.exe", "chrome.exe", "brave.exe"):
+                for view in (0, winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+                    try:
+                        with winreg.OpenKey(
+                            hive,
+                            rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe}",
+                            0,
+                            winreg.KEY_READ | view,
+                        ) as key:
+                            value, _kind = winreg.QueryValueEx(key, "")
+                    except OSError:
+                        continue
+                    if value:
+                        candidates.append(Path(value))
+    except ImportError:
+        pass
+
+    for variable in ("PROGRAMFILES(X86)", "PROGRAMFILES", "LOCALAPPDATA"):
+        base = os.environ.get(variable)
+        if not base:
+            continue
+        candidates.extend([
+            Path(base) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+            Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe",
+            Path(base) / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe",
+        ])
+    for name in ("msedge", "chrome", "brave"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(Path(found))
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def open_app_window(local_url: str, window_size: tuple[int, int] = WINDOW_SIZE) -> bool:
+    """Open the dashboard as a standalone Edge/Chrome app window (no tabs or address bar).
+
+    Used when pywebview cannot start, so the UI still opens in its own window on
+    machines without the WebView2 runtime instead of in the user's browser.
+    """
+    executable = find_chromium_browser()
+    if not executable:
+        return False
+    try:
+        subprocess.Popen(
+            [
+                executable,
+                f"--app={local_url}",
+                f"--window-size={window_size[0]},{window_size[1]}",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as error:
+        print(f"Could not open the app window: {error}")
+        return False
+    return True
 
 
 def import_webview() -> tuple[Any | None, Exception | None]:

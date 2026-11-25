@@ -601,17 +601,33 @@ def stop_on_window_close(app):
 def run_interface(app, local_url, interface_mode):
     """Present the loopback web UI using the selected startup interface."""
     if interface_mode == "desktop":
-        from desktop import import_webview, run_webview
+        from desktop import (
+            import_webview,
+            open_app_window,
+            run_webview,
+            webview2_runtime_available,
+        )
 
-        webview_module, webview_error = import_webview()
-        if webview_module is not None:
-            try:
-                run_webview(app, local_url, webview_module, on_close=stop_on_window_close(app))
-                return
-            except Exception as error:
-                print(f"Could not start pywebview ({error}); opening the system browser instead.")
+        if not webview2_runtime_available():
+            print("The Edge WebView2 runtime is missing; using an app window instead.")
         else:
-            print(f"pywebview is unavailable ({webview_error}); opening the system browser instead.")
+            webview_module, webview_error = import_webview()
+            if webview_module is not None:
+                try:
+                    run_webview(app, local_url, webview_module, on_close=stop_on_window_close(app))
+                    return
+                except Exception as error:
+                    print(f"Could not start pywebview ({error}); trying an app window instead.")
+            else:
+                print(f"pywebview is unavailable ({webview_error}); trying an app window instead.")
+
+        # A chromeless Edge/Chrome window still looks like the normal SBM window and
+        # needs neither pywebview nor the WebView2 runtime.
+        if open_app_window(local_url):
+            print("SBM is running in an app window.")
+            app.run(host="127.0.0.1", port=int(local_url.rsplit(":", 1)[1]),
+                    debug=False, use_reloader=False, threaded=True)
+            return
         interface_mode = "browser"
 
     if interface_mode == "browser":
@@ -620,7 +636,7 @@ def run_interface(app, local_url, interface_mode):
     else:
         print(f"SBM is running headless. Open {local_url} manually to use the local web UI.")
 
-    app.run(host="127.0.0.1", port=int(local_url.rsplit(":", 1)[1]), debug=False, use_reloader=False)
+    app.run(host="127.0.0.1", port=int(local_url.rsplit(":", 1)[1]), debug=False, use_reloader=False, threaded=True)
 
 if __name__ == "__main__" and CLI_ARGS.benchmark:
     from benchmark import format_report, run_benchmark

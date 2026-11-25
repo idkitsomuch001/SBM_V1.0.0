@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from datetime import date
 import hmac
+import json
 import logging
 import secrets
 import threading
+import time
 from urllib.parse import urlsplit
 
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, Response, jsonify, render_template, request, send_file, stream_with_context
 from werkzeug.exceptions import HTTPException
 
 from discord_bot import DiscordBot
@@ -370,6 +372,49 @@ def create_app(bot_main, start_discord_bot=False):
             start_date=start_date,
             end_date=end_date,
         ))
+
+    @app.get("/api/history/stream")
+    def history_stream():
+        """Push a tiny revision event whenever a new match reaches the CSV.
+
+        A hidden/background WebView throttles its JavaScript timers, so the
+        History tab's one-second poll can pause while the game is running. An
+        open response stream is not throttled and wakes the UI immediately.
+        """
+        def event_stream():
+            last_revision = None
+            last_heartbeat = time.monotonic()
+            while True:
+                status = runtime_manager.get_status()
+                csv_path = resolve_project_path("cfg", "match_history.csv")
+                try:
+                    stat = csv_path.stat()
+                    file_revision = [stat.st_mtime_ns, stat.st_size]
+                except OSError:
+                    file_revision = None
+                revision = [
+                    file_revision,
+                    status.get("session_started_at") if status.get("is_running") else None,
+                    status.get("state"),
+                ]
+
+                try:
+                    if revision != last_revision:
+                        last_revision = revision
+                        last_heartbeat = time.monotonic()
+                        yield f"data: {json.dumps({'revision': revision})}\n\n"
+                    elif time.monotonic() - last_heartbeat >= 15:
+                        last_heartbeat = time.monotonic()
+                        yield ": keep-alive\n\n"
+                except (GeneratorExit, BrokenPipeError, ConnectionResetError):
+                    return
+                time.sleep(0.5)
+
+        return Response(
+            stream_with_context(event_stream()),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/api/assets/brawlers/<path:brawler_name>")
     def brawler_icon(brawler_name: str):

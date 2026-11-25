@@ -145,6 +145,7 @@ class WindowController:
             self.last_frame = None
             self.last_frame_time = 0.0
             self.last_joystick_pos = (None, None)
+            self.last_joystick_move_time = 0.0
             self.FRAME_STALE_TIMEOUT = 15.0
             self.re_apply_movement = config_bool(
                 load_toml_as_dict("cfg/debug_settings.toml").get("re_apply_movement"),
@@ -393,19 +394,27 @@ class WindowController:
             self.touch_move(target_x, target_y, pointer_id=self.PID_JOYSTICK)
             self.are_we_moving = True
             self.last_joystick_pos = (target_x, target_y)
+            self.last_joystick_move_time = time.time()
             return
 
-        if not self.re_apply_movement and self.last_joystick_pos == (target_x, target_y):
+        now = time.time()
+        same_position = self.last_joystick_pos == (target_x, target_y)
+        # A held direction is still re-sent periodically: a lost touch (respawn, scrcpy
+        # reconnect, Android gesture timeout) otherwise freezes the character while the
+        # bot believes it is moving, until the game shows its idle warning.
+        if not self.re_apply_movement and same_position and now - self.last_joystick_move_time < 0.6:
             return
 
         self.touch_move(target_x, target_y, pointer_id=self.PID_JOYSTICK)
         self.last_joystick_pos = (target_x, target_y)
+        self.last_joystick_move_time = now
 
     def release_movement(self):
         if self.are_we_moving:
             self.touch_up(self.movement_joystick_x, self.movement_joystick_y, pointer_id=self.PID_JOYSTICK)
             self.are_we_moving = False
             self.last_joystick_pos = (None, None)
+            self.last_joystick_move_time = 0.0
 
     def click(self, x: int, y: int, delay=0.02, already_include_ratio=True, touch_up=True, touch_down=True):
         if not already_include_ratio:

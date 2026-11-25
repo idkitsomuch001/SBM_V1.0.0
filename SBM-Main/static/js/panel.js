@@ -112,6 +112,7 @@ const state = {
     mainViewScrollbarCleanup: null,
     runtimePollTimer: null,
     historyPollTimer: null,
+    historyStreamStarted: false,
     historyRefreshInFlight: null,
     authSubmitting: false,
     autoScrollLogs: true,
@@ -332,6 +333,7 @@ async function bootstrap(cachedPayload = null) {
     showPendingAnnouncements();
     startRuntimePolling();
     startHistoryPolling();
+    startHistoryStream();
 }
 
 
@@ -2194,6 +2196,48 @@ function startRuntimePolling() {
 function startHistoryPolling() {
     if (state.historyPollTimer) return;
     state.historyPollTimer = setInterval(refreshVisibleHistory, 1000);
+}
+
+function startHistoryStream() {
+    // An open response stream keeps delivering while the window is in the
+    // background, unlike the poll timer which the WebView can throttle.
+    if (state.historyStreamStarted) return;
+    state.historyStreamStarted = true;
+    (async () => {
+        while (state.historyStreamStarted) {
+            try {
+                const response = await fetch("/api/history/stream", {
+                    headers: {
+                        "X-SBM-UI-Token": UI_API_TOKEN,
+                        "Accept": "text/event-stream",
+                    },
+                    cache: "no-store",
+                });
+                if (!response.ok || !response.body) throw new Error("History stream unavailable");
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = "";
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+
+                    let boundary;
+                    while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+                        const event = buffer.slice(0, boundary);
+                        buffer = buffer.slice(boundary + 2);
+                        if (event.split("\n").some((line) => line.startsWith("data:"))) {
+                            refreshMatchHistory();
+                        }
+                    }
+                }
+            } catch {
+                // Keep the one-second poll as a fallback and retry the stream.
+            }
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+        }
+    })();
 }
 
 function refreshVisibleHistory() {

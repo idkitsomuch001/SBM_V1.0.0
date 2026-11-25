@@ -1,5 +1,6 @@
 import math
 import random
+import threading
 import time
 import cv2
 import numpy as np
@@ -19,6 +20,22 @@ hypercharge_crop_area = load_toml_as_dict("./cfg/lobby_config.toml")['pixel_coun
 POISON_LOW_HSV = np.array((30, 90, 221), dtype=np.uint8)
 POISON_HIGH_HSV = np.array((57, 114, 235), dtype=np.uint8)
 PLAYER_HIT_CIRCLE_RADIUS = 53
+
+
+def _lower_current_thread_priority():
+    """Let entity inference win on a CPU-bound PC; terrain can afford to arrive a little later."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentThread.restype = wintypes.HANDLE
+        kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+        kernel32.SetThreadPriority.restype = wintypes.BOOL
+        kernel32.SetThreadPriority(kernel32.GetCurrentThread(), -1)  # THREAD_PRIORITY_BELOW_NORMAL
+    except Exception:
+        pass
 
 class Play:
     _selected_enemy_spawnable = None
@@ -47,6 +64,10 @@ class Play:
         self.last_water_data = []
         self.last_rope_fence_data = []
         self.last_movement_obstacles = []
+        self._terrain_lock = threading.Lock()
+        self._terrain_result = None
+        self._terrain_busy = False
+        self._terrain_scan_seconds = 0.0
         self.keys_hold = []
         self.time_since_different_movement = time.time()
         self.time_since_gadget_checked = time.time()
@@ -70,7 +91,9 @@ class Play:
         self.tile_detector_model_classes = bot_config["wall_model_classes"]
         self.Detect_tile_detector =Detect(
             tile_detector_model,
-            classes=self.tile_detector_model_classes
+            classes=self.tile_detector_model_classes,
+            # CPU terrain inference is far slower than the entity model; keep it from taking every core.
+            cpu_threads=2,
         )
 
         self.time_since_walls_checked = 0
@@ -86,6 +109,8 @@ class Play:
 
         self.last_movement = ''
         self.last_movement_change_time = time.time()
+        self.last_nonzero_movement = (0.0, -float(JOYSTICK_RADIUS))
+        self.time_since_nonzero_movement = time.time()
         self.minimum_movement_delay = bot_config["minimum_movement_delay"]
         self.no_detection_proceed_delay = time_config["no_detection_proceed"]
         self.gadget_pixels_minimum = bot_config["gadget_pixels_minimum"]
@@ -355,12 +380,77 @@ class Play:
 
         return False
 
-    def is_enemy_hittable(self, player_pos, enemy_pos, walls, skill_type):
-        if self.can_attack_through_walls(self.current_brawler, skill_type, self.brawlers_info):
-            return True
-        if self.walls_block_line_of_sight(player_pos, enemy_pos, walls):
+    def brawler_ignores_walls(self, skill_type):
+        brawler = self.current_brawler
+        if not brawler or not self.brawlers_info or brawler not in self.brawlers_info:
             return False
+        return bool(self.can_attack_through_walls(brawler, skill_type, self.brawlers_info))
+
+    def shot_origin(self, player_pos):
+        """Shots leave from the hit circle at the player's feet, not from the box centre."""
+        player_box = (self.context or {}).get('player_data') if self.context else None
+        if player_box and len(player_box) >= 4:
+            center, _radius = self.get_player_hit_circle(player_box)
+            if center is not None:
+                return center
+        return player_pos
+
+    @staticmethod
+    def enemy_ground_point(enemy_box, aim_point=None):
+        """The enemy's ground position (box bottom), shifting a predicted aim point there."""
+        x1, y1, x2, y2 = (float(value) for value in enemy_box[:4])
+        if aim_point is None:
+            return ((x1 + x2) / 2.0, y2)
+        box_center_y = (y1 + y2) / 2.0
+        return (float(aim_point[0]), float(aim_point[1]) + (y2 - box_center_y))
+
+    def is_enemy_box_hittable(self, player_pos, enemy_box, walls, skill_type, aim_point=None):
+        """Box-aware line of sight; rejects enemies peeking over a wall.
+
+        The entity model still detects a brawler that is half hidden behind a wall and
+        its box centre then sits above the wall, so a centre-only check says the shot is
+        clear. Shots travel along the ground, so the enemy's ground contact is checked
+        too, and a ground point inside a wall face means it is peeking over it.
+        """
+        if self.brawler_ignores_walls(skill_type):
+            return True
+        if not walls or enemy_box is None or len(enemy_box) < 4:
+            return True
+        origin = self.shot_origin(player_pos)
+        center = aim_point if aim_point is not None else self.get_entity_pos(enemy_box)
+        center = (float(center[0]), float(center[1]))
+        ground = self.enemy_ground_point(enemy_box, center)
+        if self.walls_block_line_of_sight(origin, center, walls):
+            return False
+        if self.walls_block_line_of_sight(origin, ground, walls):
+            return False
+        for wall in walls:
+            x1, y1, x2, y2 = wall[:4]
+            if x1 <= ground[0] <= x2 and y1 <= ground[1] <= y2:
+                return False
         return True
+
+    def enemy_box_for_point(self, point):
+        """The detection box a playstyle point was derived from on this frame."""
+        for box in (self.context or {}).get('enemy_data') or []:
+            if len(box) < 4:
+                continue
+            center = self.get_entity_pos(box)
+            if abs(center[0] - point[0]) <= 2.0 and abs(center[1] - point[1]) <= 2.0:
+                return box
+        return None
+
+    def is_enemy_hittable(self, player_pos, enemy_pos, walls, skill_type):
+        if self.brawler_ignores_walls(skill_type):
+            return True
+        if not walls:
+            return True
+        enemy_box = self.enemy_box_for_point(enemy_pos)
+        if enemy_box is not None:
+            return self.is_enemy_box_hittable(
+                player_pos, enemy_box, walls, skill_type, enemy_pos)
+        return not self.walls_block_line_of_sight(
+            self.shot_origin(player_pos), enemy_pos, walls)
 
     @staticmethod
     def enemy_targets(data):
@@ -434,6 +524,17 @@ class Play:
         return closest_teammate, closest_distance
 
     def is_there_poison_gas(self, player_data, threshold=7000, area_from_player_checked=1.5):
+        # The raw threshold is tuned for a 1080p capture. At 720p the checked area is
+        # only 44% of it, so the fixed 7000 px silently reported "no gas" everywhere.
+        scale = float(self.window_controller.scale_factor or 1.0)
+        threshold = float(threshold) * scale * scale
+        if getattr(self, 'frame', None) is None:
+            return {
+                "up": 0,
+                "down": 0,
+                "left": 0,
+                "right": 0,
+            }
         actual_player_box = self.get_actual_player_box(player_data) or player_data
         px1, py1, px2, py2 = actual_player_box
         player_width = max(px2 - px1, 1)
@@ -493,6 +594,48 @@ class Play:
                     )
 
         return result
+
+    def avoid_poison_gas(self, player_data):
+        """Escape the gas even when a playstyle or the dodger wanted to move into it.
+
+        Runs after the playstyle and the auto dodger, so no other decision can undo it.
+        """
+        if not player_data or len(player_data) < 4:
+            return None
+        try:
+            gas = self.is_there_poison_gas(player_data, area_from_player_checked=2.5)
+        except Exception:
+            return None
+        if not any(gas.values()):
+            return None
+
+        x = 0
+        y = 0
+        if gas["left"] or gas["right"]:
+            x = JOYSTICK_RADIUS if gas["left"] >= gas["right"] else -JOYSTICK_RADIUS
+        if gas["up"] or gas["down"]:
+            y = JOYSTICK_RADIUS if gas["up"] >= gas["down"] else -JOYSTICK_RADIUS
+        if x == 0 and y == 0:
+            return None
+
+        walls = (self.context or {}).get("walls") or []
+        options = [(x, y), (x, 0), (0, y)]
+        fallbacks = sorted(
+            [
+                ((0, -JOYSTICK_RADIUS), gas["up"]),
+                ((0, JOYSTICK_RADIUS), gas["down"]),
+                ((-JOYSTICK_RADIUS, 0), gas["left"]),
+                ((JOYSTICK_RADIUS, 0), gas["right"]),
+            ],
+            key=lambda item: item[1],
+        )
+        options.extend(move for move, _count in fallbacks)
+        for move in options:
+            if move[0] == 0 and move[1] == 0:
+                continue
+            if not self.is_path_blocked(player_data, move, walls):
+                return move
+        return None
 
     def get_main_data(self, frame, detect=True):
         """Entity detections of the frame; detect=False (a recognised menu screen): the model does not run."""
@@ -638,9 +781,10 @@ class Play:
         movement = self.get_movement()
         movement_vector = self.movement_to_vector(movement)
         if movement_vector is None:
-            self.window_controller.release_movement()
+            # Keep going instead of releasing: the idle guard at the end of the loop
+            # turns this into a free direction.
+            movement_vector = (0.0, 0.0)
             self.last_movement = ''
-            return None
         movement = self.clamp_movement(movement_vector)
         current_time = time.time()
         if movement != self.last_movement:
@@ -652,7 +796,47 @@ class Play:
         else:
             self.last_movement_change_time = current_time
         movement = self.unstuck_movement_if_needed(movement, current_time)
-        return movement
+        gas_escape = self.avoid_poison_gas(
+            self.context.get('player_data') if self.context else None)
+        if gas_escape is not None:
+            movement = gas_escape
+        return self.ensure_movement(movement, current_time)
+
+    def ensure_movement(self, movement, current_time=None):
+        """Never let the bot stand still: a zero movement becomes a free direction.
+
+        Some playstyles stand still on purpose (for example next to a teammate) and a
+        lost touch leaves the joystick at its centre. The game shows its idle warning
+        after a while without moving, so a non-zero direction is sent instead.
+        """
+        vector = self.movement_to_vector(movement)
+        if vector is not None and math.hypot(vector[0], vector[1]) >= 1.0:
+            self.last_nonzero_movement = (float(vector[0]), float(vector[1]))
+            self.time_since_nonzero_movement = time.time() if current_time is None else current_time
+            return movement
+
+        player = (self.context or {}).get('player_data') if self.context else None
+        walls = (self.context or {}).get('walls') or []
+        options = [self.last_nonzero_movement]
+        options.extend([
+            (0, -JOYSTICK_RADIUS), (0, JOYSTICK_RADIUS),
+            (-JOYSTICK_RADIUS, 0), (JOYSTICK_RADIUS, 0),
+            self.normalize_move(-JOYSTICK_RADIUS, -JOYSTICK_RADIUS),
+            self.normalize_move(JOYSTICK_RADIUS, -JOYSTICK_RADIUS),
+            self.normalize_move(-JOYSTICK_RADIUS, JOYSTICK_RADIUS),
+            self.normalize_move(JOYSTICK_RADIUS, JOYSTICK_RADIUS),
+        ])
+        for option in options:
+            if player and len(player) >= 4 and self.is_path_blocked(player, option, walls):
+                continue
+            self.last_nonzero_movement = (float(option[0]), float(option[1]))
+            self.time_since_nonzero_movement = time.time() if current_time is None else current_time
+            return option
+        # Everything is blocked (a tight corner): keep the joystick deflected anyway,
+        # which still counts as activity for the game's idle detection.
+        fallback = self.last_nonzero_movement
+        self.time_since_nonzero_movement = time.time() if current_time is None else current_time
+        return fallback
 
     def check_if_hypercharge_ready(self, frame):
         wr, hr = self.window_controller.width_ratio, self.window_controller.height_ratio
@@ -724,13 +908,13 @@ class Play:
         tile_data = self.Detect_tile_detector.detect_objects(frame, conf_tresh=self.wall_detection_confidence)
         return tile_data
 
-    def process_tile_data(self, tile_data):
+    def split_tile_data(self, tile_data):
         walls = []
         bushes = []
         water = []
         rope_fences = []
-        self.last_movement_obstacles = (tile_data.get('rope_fence', []) + tile_data.get('water', [])
-                                        + tile_data.get('out_of_bounds', []))
+        obstacles = (tile_data.get('rope_fence', []) + tile_data.get('water', [])
+                     + tile_data.get('out_of_bounds', []))
         for class_name, boxes in tile_data.items():
             if class_name == 'out_of_bounds':
                 continue
@@ -742,9 +926,77 @@ class Play:
                 rope_fences.extend(boxes)
             else:
                 walls.extend(boxes)
+        return walls, bushes, water, rope_fences, obstacles
+
+    def process_tile_data(self, tile_data):
+        walls, bushes, water, rope_fences, obstacles = self.split_tile_data(tile_data)
+        self.last_movement_obstacles = obstacles
         self.last_water_data = water
         self.last_rope_fence_data = rope_fences
         return walls, bushes, water, rope_fences
+
+    def terrain_scan_interval(self):
+        """Configured terrain interval, raised automatically when a scan is slow (CPU-only/low-end PCs).
+
+        A scan costs roughly its wall-clock time in CPU work. Repeating it every 0.2 s on a machine where it takes
+        0.5 s would keep the terrain worker busy almost continuously and starve entity detection. The GPU path scans
+        in well under 0.1 s, so this leaves its 0.2 s cadence unchanged.
+        """
+        with self._terrain_lock:
+            duration = self._terrain_scan_seconds
+        return max(self.walls_treshold, min(2.5, duration * 2.5))
+
+    def request_terrain_scan(self, frame, player_data=None):
+        """Run terrain perception away from the frame loop; the next frame keeps using the latest walls."""
+        with self._terrain_lock:
+            if self._terrain_busy:
+                return False
+            self._terrain_busy = True
+        try:
+            threading.Thread(
+                target=self._scan_terrain,
+                args=(frame, player_data),
+                daemon=True,
+                name="sbm-terrain-scan",
+            ).start()
+        except Exception as exc:
+            with self._terrain_lock:
+                self._terrain_busy = False
+            print(f"Could not start terrain scan: {exc}")
+            return False
+        return True
+
+    def _scan_terrain(self, frame, player_data):
+        _lower_current_thread_priority()
+        result = None
+        started = time.perf_counter()
+        try:
+            result = self.split_tile_data(self.get_tile_data(frame, player_data))
+        except Exception as exc:
+            print(f"Terrain scan failed: {exc}")
+        elapsed = time.perf_counter() - started
+        with self._terrain_lock:
+            if self._terrain_scan_seconds <= 0:
+                self._terrain_scan_seconds = elapsed
+            else:
+                self._terrain_scan_seconds = self._terrain_scan_seconds * 0.7 + elapsed * 0.3
+            if result is not None:
+                self._terrain_result = result
+            self._terrain_busy = False
+
+    def consume_terrain_result(self):
+        with self._terrain_lock:
+            result = self._terrain_result
+            self._terrain_result = None
+        if result is None:
+            return False
+        walls, bushes, water, rope_fences, obstacles = result
+        self.last_walls_data = walls
+        self.last_bushes_data = bushes
+        self.last_water_data = water
+        self.last_rope_fence_data = rope_fences
+        self.last_movement_obstacles = obstacles
+        return True
 
     def get_movement(self):
         self._selected_enemy_spawnable = None
@@ -812,22 +1064,15 @@ class Play:
         # Walls are only used while the player is played: not updated once it has been missing for a second (dead,
         # spectating, loading); a player seen on this frame updates them at once.
         player_present = bool(data.get("player")) or current_time - self.time_since_player_last_found < 1.0
+        self.consume_terrain_result()
         if (not recognised_screen and player_present
-                and current_time - self.time_since_walls_checked > self.walls_treshold):
-            tile_data = self.get_tile_data(frame, data.get("player"))
-            walls, bushes, water, rope_fence = self.process_tile_data(tile_data)
-            self.time_since_walls_checked = current_time
-            self.last_walls_data = walls
-            data['wall'] = walls
-            self.last_bushes_data = bushes
-            data['bush'] = bushes
-            data['water'] = water
-            data['rope_fence'] = rope_fence
-        else:
-            data['wall'] = self.last_walls_data
-            data['bush'] = self.last_bushes_data
-            data['water'] = self.last_water_data
-            data['rope_fence'] = self.last_rope_fence_data
+                and current_time - self.time_since_walls_checked > self.terrain_scan_interval()):
+            if self.request_terrain_scan(frame, data.get("player")):
+                self.time_since_walls_checked = current_time
+        data['wall'] = self.last_walls_data
+        data['bush'] = self.last_bushes_data
+        data['water'] = self.last_water_data
+        data['rope_fence'] = self.last_rope_fence_data
 
         self.match_logger.log_frame(t=time.perf_counter(), state=main.get_latest_state(), detections=data)
         data = self.validate_game_data(data)
